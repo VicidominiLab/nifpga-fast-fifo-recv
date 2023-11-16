@@ -1,12 +1,12 @@
 [package]
 name = "nifpga-fast-fifo-recv"
 readme = "README.md"
-version = "0.100.1"
+version = "0.101.1"
 edition = "2021"
 license = "MIT"
 authors = ["Mattia Donato"]
-description = "A Python module for fast reading of data from NI FPGA FIFOs with a separate thread."
-repository = "https://github.com/mattia-donato/nifpga-fast-fifo-recv"
+description = "An unofficial Python module for fast reading of data from NI FPGA FIFOs with a separate thread."
+repository = "https://github.com/VicidominiLab/nifpga-fast-fifo-recv"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
