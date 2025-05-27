@@ -3,6 +3,7 @@ extern crate nifpga_dll;
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use std::thread;
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use crossbeam;
 use nifpga_dll::Session;
@@ -20,6 +21,7 @@ struct Configuration {
     dma_buffer_size: usize,
     fifo_reading_buffer: usize,
     min_packet: usize,
+    delay_us: u64,
     debug: bool
 }
 
@@ -59,7 +61,8 @@ fn fpga_loop(conf: &Configuration, tx: &crossbeam::channel::Sender<Vec<u64>>, st
 
         // let last_time = Instant::now();
         if data_available==0 {
-
+            
+            if conf.delay_us>0 {std::thread::sleep(Duration::from_micros(conf.delay_us)); };
             data_available = (reader.read(&mut read_buff_zero_size, 0).unwrap() / conf.min_packet)*conf.min_packet;
 
             if debug==true {
@@ -142,7 +145,7 @@ impl NifpgaFastFifoRecv {
     ///NifpgaFastFifoRecv(bitfile, signature, run, close_on_reset, fifo, dma_buffer_size,
     ///fifo_reading_buffer, fifo_buffer_size)
     #[new]
-    #[pyo3(signature = (bitfile = "X", signature = "ABCD12345678", ni_address = "RI0", run = false, close_on_reset = false, fifo = 0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1, debug = false))]
+    #[pyo3(signature = (bitfile = "X", signature = "ABCD12345678", ni_address = "RI0", run = false, close_on_reset = false, fifo = 0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1, delay_us = 0, debug = false))]
     fn new(bitfile: &str,
            signature: &str,
            ni_address:  &str,
@@ -152,6 +155,7 @@ impl NifpgaFastFifoRecv {
            dma_buffer_size: usize,
            fifo_reading_buffer: usize,
            min_packet: usize,
+           delay_us: u64,
            debug: bool) -> Self {
 
         let (tx, rx) = crossbeam::channel::unbounded();
@@ -164,6 +168,7 @@ impl NifpgaFastFifoRecv {
                                                  dma_buffer_size,
                                                  fifo_reading_buffer,
                                                  min_packet,
+                                                 delay_us,
                                                  debug},
                   tx: tx,
                   rx: rx,
@@ -274,6 +279,7 @@ impl NifpgaFastFifoRecv {
             // ("port", self.conf.port.to_object(py)),
             ("dma_buffer_size", self.conf.dma_buffer_size.to_object(py)),
             ("fifo_reading_buffer", self.conf.fifo_reading_buffer.to_object(py)),
+            ("delay_us", self.conf.delay_us.to_object(py)),
             ("min_packet", self.conf.min_packet.to_object(py))
         ];
         let d = vect_for_dict.into_py_dict(py);
