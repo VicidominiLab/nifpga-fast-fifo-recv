@@ -1,7 +1,14 @@
 extern crate nifpga_dll;
 
 use pyo3::prelude::*;
-use pyo3::types::IntoPyDict;
+use pyo3::types::PyDict;
+use pyo3::types::PyTuple;
+
+use numpy::{PyArray1};
+//use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
+// use rayon::prelude::*;
+
+
 use std::thread;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
@@ -123,7 +130,7 @@ fn fpga_loop(conf: &Configuration, tx: &crossbeam::channel::Sender<Vec<u64>>, st
 /// This allow to receive data from nifpga in Python without loosing data even for fast data-rate.
 ///
 #[pymodule]
-fn nifpga_fast_fifo_recv(_py: Python, m: &PyModule) -> PyResult<()> {
+fn nifpga_fast_fifo_recv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<NifpgaFastFifoRecv>()?;
     Ok(())
@@ -178,12 +185,11 @@ impl NifpgaFastFifoRecv {
     }
 
     ///thread_start run the thread
-    fn thread_start(&mut self, _py: Python) -> PyResult<()> {
+    fn thread_start(&mut self, _py: Python<'_>) -> PyResult<()> {
         println!("Start two threads.");
         let conf_local = self.conf.clone();
         let tx_local = self.tx.clone();
         let stop_event = self.stop_event.clone();
-
 
         match &self.thread_handle {
             Some(_x)=>{
@@ -198,8 +204,6 @@ impl NifpgaFastFifoRecv {
                 println!("Thread started!");
 
                 self.thread_handle = Some(handle);
-
-
             },
         };
 
@@ -207,7 +211,9 @@ impl NifpgaFastFifoRecv {
     }
 
     ///thread_is_running return true is thread is running
-    fn thread_is_running(&mut self, py: Python) -> PyResult<PyObject> {
+    ///
+    /// returns a bool (PyO3 will convert to Python bool)
+    fn thread_is_running(&mut self) -> PyResult<bool> {
         let status = match &self.thread_handle {
             Some(_x)=>{
                 true
@@ -216,11 +222,11 @@ impl NifpgaFastFifoRecv {
                 false
             },
         };
-        Ok(status.to_object(py).into())
+        Ok(status)
     }
 
     ///thread_stop stop the thread
-    fn thread_stop(&mut self, _py: Python) -> PyResult<()> {
+    fn thread_stop(&mut self, _py: Python<'_>) -> PyResult<()> {
         *self.stop_event.lock().unwrap() = true;
         println!("stop_event True");
 
@@ -238,55 +244,109 @@ impl NifpgaFastFifoRecv {
         Ok(())
     }
 
-    ///get data from the internal queue
-    fn get_data(&mut self, py: Python) -> PyResult<PyObject> {
-        let empty_vec:Vec<u64> = Vec::new();
+
+    fn get_data(&mut self) -> PyResult<Vec<u64>> {
+        self.get_data_as_list()
+    }
+    
+    // /// Get data as a NumPy array    
+    fn get_data_as_numpy<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyArray1<u64>>> {
         let debug = self.conf.debug;
+        
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let mut combined: Vec<u64> = Vec::new();
+        
+        // Collect all items efficiently
+        while let Ok(item) = self.rx.try_recv() {
+            combined.extend(item);
+        }
+        
+        if debug {
+            println!("combined.len() = {}", combined.len());
+        }
+        
+        // Zero-copy: transfer ownership directly to NumPy without cloning
+        let array = PyArray1::from_vec(py, combined);
+        Ok(array.into())
+    }
 
-        if debug==true {
-            if self.rx.len() > 0 {
-                println!("self.rx.len() {}", self.rx.len());
-            }
+
+
+    /// Get data as a Python tuple
+    fn get_data_as_ntuple<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyTuple>> {
+        let debug = self.conf.debug;
+        let mut combined: Vec<u64> = Vec::new();
+
+        while let Ok(item) = self.rx.try_recv() {
+            combined.extend(item);
         }
 
-        let vec_all_rx: Vec<Vec<u64>> = self.rx.try_iter().collect();
-
-        if vec_all_rx.len()>0 {
-            let vec_joined:Vec<u64> = vec_all_rx.into_iter().flatten().collect();
-            if debug==true {
-                println!("vec_joined.len() = {}", vec_joined.len());
-            }
-            //send to Python an array object
-            Ok(vec_joined.to_object(py).into())
-        }
-        else
-        {
-            //send to Python an empty object
-            Ok(empty_vec.to_object(py).into())
+        if debug {
+            println!("combined.len() = {}", combined.len());
         }
 
+        // PyTuple::new returns Result<Bound<PyTuple>, PyErr>, so unwrap it via ? first
+        let tuple = PyTuple::new(py, combined)?;
+        Ok(tuple.into()) // now we can convert Bound<PyTuple> -> Py<PyTuple>
+    }
+
+    /// Get data from the internal queue
+    ///
+    /// Drains the channel directly into a single Vec<u64>
+    /// Returns a Python list of ints (PyO3 will convert automatically)
+    fn get_data_as_list(&mut self) -> PyResult<Vec<u64>> {
+        let debug = self.conf.debug;
+        let mut combined: Vec<u64> = Vec::new();
+
+        // Drain the channel directly into a single vector
+        while let Ok(item) = self.rx.try_recv() {
+            combined.extend(item); // assuming item: Vec<u64>
+        }
+
+        if debug {
+            println!("combined.len() = {}", combined.len());
+        }
+
+        Ok(combined) // PyO3 converts Vec<u64> -> Python list automatically
     }
 
     ///get the current configuration
-    fn get_conf(&mut self, py: Python) -> PyResult<PyObject> {
-        let vect_for_dict: Vec<(&str, PyObject)> = vec![
-            ("bit_file", self.conf.bit_file.to_object(py)),
-            ("signature", self.conf.signature.to_object(py)),
-            ("ni_address", self.conf.ni_address.to_object(py)),
-            ("run", self.conf.run.to_object(py)),
-            ("close_on_reset", self.conf.close_on_reset.to_object(py)),
-            ("fifo", self.conf.fifo.to_object(py)),
-            // ("port", self.conf.port.to_object(py)),
-            ("dma_buffer_size", self.conf.dma_buffer_size.to_object(py)),
-            ("fifo_reading_buffer", self.conf.fifo_reading_buffer.to_object(py)),
-            ("delay_us", self.conf.delay_us.to_object(py)),
-            ("min_packet", self.conf.min_packet.to_object(py))
-        ];
-        let d = vect_for_dict.into_py_dict(py);
+    /// returns a Python dict with all configuration fields
+    fn get_conf(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let d = PyDict::new(py);
+
+        d.set_item("bit_file", &self.conf.bit_file)?;
+        d.set_item("signature", &self.conf.signature)?;
+        d.set_item("ni_address", &self.conf.ni_address)?;
+        d.set_item("run", self.conf.run)?;
+        d.set_item("close_on_reset", self.conf.close_on_reset)?;
+        d.set_item("fifo", self.conf.fifo)?;
+        d.set_item("dma_buffer_size", self.conf.dma_buffer_size)?;
+        d.set_item("fifo_reading_buffer", self.conf.fifo_reading_buffer)?;
+        d.set_item("delay_us", self.conf.delay_us)?;
+        d.set_item("min_packet", self.conf.min_packet)?;
+
         Ok(d.into())
     }
 
+    ///get the current configuration
+    ///
+    /// returns a tuple:
+    /// (bit_file, signature, ni_address, run, close_on_reset, fifo, dma_buffer_size, fifo_reading_buffer, delay_us, min_packet)
+    /// Python callers can unpack or convert to dict as they prefer.
+    fn get_conf_as_tuple(&mut self) -> PyResult<(String, String, String, bool, bool, u32, usize, usize, u64, usize)> {
+        Ok((
+            self.conf.bit_file.clone(),
+            self.conf.signature.clone(),
+            self.conf.ni_address.clone(),
+            self.conf.run,
+            self.conf.close_on_reset,
+            self.conf.fifo,
+            self.conf.dma_buffer_size,
+            self.conf.fifo_reading_buffer,
+            self.conf.delay_us,
+            self.conf.min_packet,
+        ))
+    }
 
 }
-
-
