@@ -117,6 +117,59 @@ pip install maturin
 
 and you need also the **NiFpga.dll** installed in your system.
 
+### Build and publish Windows wheels locally
+
+GitHub Actions cannot build this project because the proprietary NI libraries are
+required. On a Windows machine with the NI FPGA runtime, Rust, MSYS2 UCRT64, and
+the desired CPython versions installed, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1
+```
+
+The script adds `C:\msys64\ucrt64\bin` to `PATH`, discovers every CPython 3.10+
+registered with the Windows `py` launcher, builds a release wheel for each one,
+checks the wheel metadata, and tests each wheel in a clean virtual environment.
+When an explicitly requested version is not installed system-wide, the script
+downloads an isolated, uv-managed CPython into `.release-python`. This directory
+is ignored by Git and can be deleted after the release. At least one system
+Python 3.10+ installation is needed to bootstrap the release tools. Use
+`-PythonInstallDir` to select a different temporary location.
+The same workflow is available through the batch wrapper:
+
+```bat
+build-wheels.bat
+```
+
+To require a specific complete set of interpreters (and fail if one is missing),
+use for example:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 -PythonVersion 3.10,3.11,3.12,3.13,3.14
+```
+
+Wheels are written to `dist`. Upload is intentionally separate from the default
+build. Configure a PyPI API token in `$env:TWINE_PASSWORD` and use `__token__` as
+the username:
+
+```powershell
+$env:TWINE_USERNAME = "__token__"
+$env:TWINE_PASSWORD = "pypi-your-token"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 -PythonVersion 3.10,3.11,3.12,3.13,3.14 -Publish
+```
+
+Use `-Repository testpypi -Publish` for a TestPyPI trial. Existing files in
+`dist` are included in validation and upload, so use a fresh output directory
+for each release (for example, `-OutDir dist-0.101.11`).
+
+The publishing batch wrapper automatically supplies `-Publish` and forwards any
+additional options:
+
+```bat
+publish-wheels.bat -PythonVersion 3.10,3.11,3.12,3.13,3.14
+publish-wheels.bat -Repository testpypi -PythonVersion 3.13
+```
+
 # License #
 Copyright (c) 2023 Istituto Italiano di Tecnologia
 
