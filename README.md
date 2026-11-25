@@ -9,6 +9,20 @@ The module is developed in Rust by using `maturin`, `pyo3` and the Rust library 
 As described in the example below, `nifpga-fast-fifo-recv` does not require the `nifpga` Python module but in typical applications is strongly recommended to use with it.
 
 Disclaimer: **The `nifpga-fast-fifo-recv` Python module is NOT an official NI library!** This library is an independent and autonomous development, unaffiliated with NI.
+## NI proprietary software policy
+
+**This repository and its source and binary distributions contain no proprietary
+NI source code, object code, or library binaries.** The project uses open-source
+Rust bindings to declare NI API functions; these bindings do not include NI's
+proprietary implementation.
+
+**NI integration is permitted only through dynamic linking** to `NiFpga.dll`
+provided by a separate, official NI installation on the user's computer.
+Statically linking, embedding, copying, bundling, or redistributing proprietary
+NI code or libraries in this repository or its releases is not permitted.
+
+No NI software is required to build the package. Importing and using it requires
+the official NI runtime and the appropriate hardware drivers installed separately.
 
 
 
@@ -41,7 +55,7 @@ fifo = NifpgaFastFifoRecv(bitfile = "myfile.lvbitx",
 
 fifo.thread_start()
 
-assert(fifo.thread_status()==True)
+assert(fifo.thread_is_running()==True)
 
 for i in range(0,100):
     data=fifo.get_data()
@@ -50,7 +64,7 @@ for i in range(0,100):
     
 fifo.thread_stop()
 
-assert(fifo.thread_status()==False)
+assert(fifo.thread_is_running()==False)
 ```
 
 Please note that in the example above `run = False` that means that the FPGA suppose to be already programmed
@@ -62,6 +76,50 @@ Once it is running it is possible at the same time use into another thread or pr
 
 If you do not need to control registers or other things you can directly run the bitfile from `NifpgaFastFifoRecv`
 simply by set `run = True`.
+
+Routine startup, FIFO configuration, and shutdown messages are printed only when
+`debug=True` is passed to the constructor. Errors remain visible on standard error
+and in `get_status()["last_error"]`. Calling `thread_stop()` more than once is safe.
+
+The constructor validates packet and buffer sizes, optional queue capacity, and
+nonempty strings without NUL characters, raising `ValueError` before starting a
+worker. Hardware and NI driver errors are still reported asynchronously through
+`get_status()`. The default NI address is `RIO0`; `get_conf()` includes `debug`
+and `max_queue_chunks`. The existing ten-item `get_conf_as_tuple()` is unchanged.
+`thread_stop()` releases the Python GIL while waiting for the reader to finish,
+so other Python threads can continue running.
+
+### Optional queue limit
+
+By default, `max_queue_chunks=None` keeps the queue unlimited. To limit it, pass
+a positive number of chunks to the constructor, for example:
+
+```python
+fifo = NifpgaFastFifoRecv(
+    bitfile="myfile.lvbitx",
+    signature=bitfile_signature,
+    ni_address="RIO0",
+    fifo=fifo_number,
+    fifo_reading_buffer=10000,
+    max_queue_chunks=100,
+)
+```
+
+Each chunk contains at most `fifo_reading_buffer` elements, rounded down to a
+multiple of `min_packet`. Each element is eight bytes, so this example limits
+queued sample data to 8,000,000 bytes (plus queue bookkeeping, the worker buffer,
+and arrays or lists held by Python).
+
+If the queue fills, the reader stops instead of blocking or silently discarding
+data. The chunk that could not be queued is counted in
+`get_status()["elements_dropped"]`; `queue_overflow` becomes `True` and
+`last_error` describes the failure. The next call to any `get_data*()` method
+raises `OverflowError` once without consuming queued data. After catching it,
+subsequent calls can drain the chunks accepted before overflow. Stop the reader
+and drain those chunks before restarting; restarting resets the diagnostics.
+
+Hardware-free tests can be run with `cargo test --locked` and, after installing
+the built wheel, `python -m unittest discover -s tests -v`.
 
 ### How to get the `signature` and the `fifo_number` (from FIFO name)
 The `nifpga_fast_fifo_recv` in can work alone but in real application is used with `nifpga`.
@@ -85,7 +143,7 @@ The module structure is the following:
 ```
 class NifpgaFastFifoRecv(object)
      |
-     |  NifpgaFastFifoRecv(bitfile='X', signature='ABCD12345678', ni_address='RI0', run=False, close_on_reset=False, fifo=0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1)
+     |  NifpgaFastFifoRecv(bitfile='X', signature='ABCD12345678', ni_address='RIO0', run=False, close_on_reset=False, fifo=0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1, delay_us=0, debug=False, *, max_queue_chunks=None)
      |  
      |  Methods defined here:
      |  
@@ -115,13 +173,46 @@ In order to compile this project you need *maturin*
 pip install maturin
 ```
 
-and you need also the **NiFpga.dll** installed in your system.
+**Building the package does not require the NI SDK, NI drivers, or NI runtime
+libraries.** Rust generates the import library during compilation, so wheels
+can be built on machines with no NI software installed, including CI runners.
+
+**Importing and using the package requires a normal installation of the official
+NI runtime and the appropriate drivers for your hardware.** This installation
+must provide the compatible 64-bit `NiFpga.dll`. The package links to that DLL
+dynamically at runtime; NI software is not included in the wheel and must be
+installed separately on the computer running the application.
+
+### GitHub Actions and PyPI publishing
+
+`.github/workflows/publish.yml` builds Windows x64 wheels for CPython 3.10–3.14
+on standard GitHub-hosted Windows runners without installing any NI software.
+It checks the wheel metadata, rejects bundled NI DLLs or libraries, and checks
+the extension's PE import table for `NiFpga.dll`. These checks do not load the
+extension; runtime tests remain a separate check on a machine with NI installed.
+
+Pushes to `main`, pull requests, and manual workflow runs build downloadable
+artifacts. Pushing a tag matching the package version, such as `v0.102.2` for
+`version = "0.102.2"`, also publishes all five wheels and a source distribution
+to PyPI after every build succeeds.
+
+Before the first upload, configure a GitHub Trusted Publisher in the existing
+PyPI project's publishing settings:
+
+- Owner: `VicidominiLab`
+- Repository: `nifpga-fast-fifo-recv`
+- Workflow filename: `publish.yml`
+- Environment: `pypi`
+
+The publishing job uses GitHub OIDC and needs no stored PyPI API token. See the
+[PyPI Trusted Publishing instructions](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
+Tags created before this workflow was added do not trigger it retroactively.
 
 ### Build and publish Windows wheels locally
 
-GitHub Actions cannot build this project because the proprietary NI libraries are
-required. On a Windows machine with the NI FPGA runtime, Rust, MSYS2 UCRT64, and
-the desired CPython versions installed, run:
+On a Windows machine with Rust, MSYS2 UCRT64, and the desired CPython versions
+installed, run the local build script below. Its import checks require the NI
+runtime; use `-SkipTests` to build without installing NI software:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1
