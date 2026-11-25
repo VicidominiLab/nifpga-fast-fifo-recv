@@ -1,5 +1,6 @@
 extern crate nifpga_dll;
 
+use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::types::PyTuple;
@@ -15,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 #[pyclass]
 struct Configuration {
@@ -29,6 +33,53 @@ struct Configuration {
     min_packet: usize,
     delay_us: u64,
     debug: bool,
+    max_queue_chunks: Option<usize>,
+}
+
+impl Configuration {
+    fn validate(&self) -> PyResult<()> {
+        for (name, value) in [
+            ("bitfile", self.bit_file.as_str()),
+            ("signature", self.signature.as_str()),
+            ("ni_address", self.ni_address.as_str()),
+        ] {
+            if value.trim().is_empty() || value.contains('\0') {
+                return Err(PyValueError::new_err(format!(
+                    "{} must be nonempty and contain no NUL characters",
+                    name
+                )));
+            }
+        }
+        if self.min_packet == 0 {
+            return Err(PyValueError::new_err("min_packet must be greater than 0"));
+        }
+        if self.fifo_reading_buffer < self.min_packet {
+            return Err(PyValueError::new_err(
+                "fifo_reading_buffer must be at least min_packet",
+            ));
+        }
+        if self.dma_buffer_size < self.min_packet {
+            return Err(PyValueError::new_err(
+                "dma_buffer_size must be at least min_packet",
+            ));
+        }
+        if self.fifo_reading_buffer > isize::MAX as usize / std::mem::size_of::<u64>() {
+            return Err(PyValueError::new_err("fifo_reading_buffer is too large"));
+        }
+        if self.max_queue_chunks == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_queue_chunks must be greater than 0 or None",
+            ));
+        }
+        if let Some(capacity) = self.max_queue_chunks {
+            // A queue slot stores a stamp and a Vec; reject sizes that cannot fit
+            // in Rust's allocation layout before asking crossbeam to allocate.
+            if std::alloc::Layout::array::<(usize, Vec<u64>)>(capacity).is_err() {
+                return Err(PyValueError::new_err("max_queue_chunks is too large"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +87,9 @@ struct ReaderStatus {
     chunks_sent: u64,
     elements_sent: u64,
     last_error: Option<String>,
+    queue_overflow: bool,
+    overflow_error_pending: bool,
+    elements_dropped: u64,
 }
 
 fn round_down_to_packet(elements: usize, min_packet: usize) -> usize {
@@ -53,28 +107,56 @@ fn set_reader_error(status: &Arc<Mutex<ReaderStatus>>, message: String) {
     lock_reader_status(status).last_error = Some(message);
 }
 
+// Never block on a full queue: a blocking send could prevent thread_stop from joining.
+fn queue_chunk(
+    tx: &crossbeam::channel::Sender<Vec<u64>>,
+    data: Vec<u64>,
+    reader_status: &Arc<Mutex<ReaderStatus>>,
+) -> bool {
+    let elements = data.len() as u64;
+    match tx.try_send(data) {
+        Ok(()) => {
+            let mut status = lock_reader_status(reader_status);
+            status.chunks_sent = status.chunks_sent.saturating_add(1);
+            status.elements_sent = status.elements_sent.saturating_add(elements);
+            true
+        }
+        Err(crossbeam::channel::TrySendError::Full(_)) => {
+            let message = format!(
+                "FIFO queue overflow (max_queue_chunks={}): reader stopped; {} elements could not be queued",
+                tx.capacity().unwrap(), elements
+            );
+            {
+                let mut status = lock_reader_status(reader_status);
+                status.queue_overflow = true;
+                status.overflow_error_pending = true;
+                status.elements_dropped = status.elements_dropped.saturating_add(elements);
+                status.last_error = Some(message.clone());
+            }
+            eprintln!("{}", message);
+            false
+        }
+        Err(error) => {
+            set_reader_error(
+                reader_status,
+                format!("Failed to send FIFO data to queue: {}", error),
+            );
+            false
+        }
+    }
+}
+
 fn fpga_loop(
     conf: &Configuration,
     tx: &crossbeam::channel::Sender<Vec<u64>>,
     stop_event: Arc<Mutex<bool>>,
     reader_status: Arc<Mutex<ReaderStatus>>,
 ) {
-    if conf.min_packet == 0 {
-        set_reader_error(
-            &reader_status,
-            "min_packet must be greater than 0".to_string(),
-        );
+    if *stop_event.lock().unwrap() {
         return;
     }
 
     let chunk_len = round_down_to_packet(conf.fifo_reading_buffer, conf.min_packet);
-    if chunk_len == 0 {
-        set_reader_error(
-            &reader_status,
-            "fifo_reading_buffer must be at least min_packet".to_string(),
-        );
-        return;
-    }
 
     let session = match Session::open(
         conf.bit_file.as_str(),
@@ -104,12 +186,14 @@ fn fpga_loop(
         }
     };
 
-    println!(
-        "Actual DMA FIFO  {} set depth: {} actual depth: {}",
-        conf.fifo, conf.dma_buffer_size, depth
-    );
-    println!("conf.fifo_reading_buffer: {}", conf.fifo_reading_buffer);
-    println!("debug: {}", conf.debug);
+    if conf.debug {
+        println!(
+            "Actual DMA FIFO  {} set depth: {} actual depth: {}",
+            conf.fifo, conf.dma_buffer_size, depth
+        );
+        println!("conf.fifo_reading_buffer: {}", conf.fifo_reading_buffer);
+        println!("debug: {}", conf.debug);
+    }
 
     let mut read_buff: Vec<u64> = vec![0; chunk_len];
 
@@ -120,8 +204,6 @@ fn fpga_loop(
     // let debug = false;
 
     // let mut now_time = Instant::now();
-
-    *stop_event.lock().unwrap() = false;
 
     loop {
         if *stop_event.lock().unwrap() {
@@ -184,17 +266,9 @@ fn fpga_loop(
             }
 
             if elements_to_read > 0 {
-                if let Err(error) = tx.send(read_buff[..elements_to_read].to_vec()) {
-                    set_reader_error(
-                        &reader_status,
-                        format!("Failed to send FIFO data to queue: {}", error),
-                    );
+                if !queue_chunk(tx, read_buff[..elements_to_read].to_vec(), &reader_status) {
                     break;
                 }
-
-                let mut status = lock_reader_status(&reader_status);
-                status.chunks_sent = status.chunks_sent.saturating_add(1);
-                status.elements_sent = status.elements_sent.saturating_add(elements_to_read as u64);
 
                 if debug == true {
                     println!("remaining_after_read {}", remaining_after_read);
@@ -239,14 +313,24 @@ struct NifpgaFastFifoRecv {
     reader_status: Arc<Mutex<ReaderStatus>>,
 }
 
+impl NifpgaFastFifoRecv {
+    fn check_queue_overflow(&self) -> PyResult<()> {
+        let mut status = lock_reader_status(&self.reader_status);
+        if status.overflow_error_pending {
+            status.overflow_error_pending = false;
+            return Err(PyOverflowError::new_err(status.last_error.clone().unwrap()));
+        }
+        Ok(())
+    }
+}
+
 ///provaC
 #[pymethods]
 impl NifpgaFastFifoRecv {
-    ///Create a new NifpgaFastFifoRecv
-    ///NifpgaFastFifoRecv(bitfile, signature, run, close_on_reset, fifo, dma_buffer_size,
-    ///fifo_reading_buffer, fifo_buffer_size)
+    /// Create a FIFO reader, validating its configuration before starting a thread.
+    /// max_queue_chunks=None keeps the queue unlimited; positive values bound it.
     #[new]
-    #[pyo3(signature = (bitfile = "X", signature = "ABCD12345678", ni_address = "RI0", run = false, close_on_reset = false, fifo = 0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1, delay_us = 0, debug = false))]
+    #[pyo3(signature = (bitfile = "X", signature = "ABCD12345678", ni_address = "RIO0", run = false, close_on_reset = false, fifo = 0, dma_buffer_size=50000, fifo_reading_buffer=10000, min_packet=1, delay_us = 0, debug = false, *, max_queue_chunks = None))]
     fn new(
         bitfile: &str,
         signature: &str,
@@ -259,33 +343,39 @@ impl NifpgaFastFifoRecv {
         min_packet: usize,
         delay_us: u64,
         debug: bool,
-    ) -> Self {
-        let (tx, rx) = crossbeam::channel::unbounded();
-        NifpgaFastFifoRecv {
-            conf: Configuration {
-                bit_file: String::from(bitfile),
-                signature: String::from(signature),
-                ni_address: String::from(ni_address),
-                run,
-                close_on_reset,
-                fifo,
-                dma_buffer_size,
-                fifo_reading_buffer,
-                min_packet,
-                delay_us,
-                debug,
-            },
+        max_queue_chunks: Option<usize>,
+    ) -> PyResult<Self> {
+        let conf = Configuration {
+            bit_file: String::from(bitfile),
+            signature: String::from(signature),
+            ni_address: String::from(ni_address),
+            run,
+            close_on_reset,
+            fifo,
+            dma_buffer_size,
+            fifo_reading_buffer,
+            min_packet,
+            delay_us,
+            debug,
+            max_queue_chunks,
+        };
+        conf.validate()?;
+        let (tx, rx) = match max_queue_chunks {
+            Some(capacity) => crossbeam::channel::bounded(capacity),
+            None => crossbeam::channel::unbounded(),
+        };
+        Ok(NifpgaFastFifoRecv {
+            conf,
             tx: tx,
             rx: rx,
             thread_handle: None::<std::thread::JoinHandle<()>>,
             stop_event: Arc::new(Mutex::new(false)),
             reader_status: Arc::new(Mutex::new(ReaderStatus::default())),
-        }
+        })
     }
 
     ///thread_start run the thread
-    fn thread_start(&mut self, _py: Python<'_>) -> PyResult<()> {
-        println!("Start two threads.");
+    fn thread_start(&mut self, py: Python<'_>) -> PyResult<()> {
         let conf_local = self.conf.clone();
         let tx_local = self.tx.clone();
         let stop_event = self.stop_event.clone();
@@ -293,14 +383,16 @@ impl NifpgaFastFifoRecv {
 
         match self.thread_handle.take() {
             Some(handle) if handle.is_finished() => {
-                if handle.join().is_err() {
+                if py.detach(move || handle.join()).is_err() {
                     lock_reader_status(&self.reader_status).last_error =
                         Some("FIFO reader thread panicked".to_string());
                 }
             }
             Some(handle) => {
                 self.thread_handle = Some(handle);
-                eprintln!("THREAD ALREADY EXITS");
+                if self.conf.debug {
+                    println!("FIFO reader thread is already running.");
+                }
                 return Ok(());
             }
             None => {}
@@ -312,12 +404,19 @@ impl NifpgaFastFifoRecv {
         }
 
         {
+            // Reset before spawning: initialization must not erase an early stop request.
+            *self.stop_event.lock().unwrap() = false;
+            if self.conf.debug {
+                println!("Starting FIFO reader thread.");
+            }
             let handle = thread::spawn(move || {
                 //fpga_loop_dummy(&conf_local, &tx_local, stop_event);
                 fpga_loop(&conf_local, &tx_local, stop_event, reader_status)
             });
 
-            println!("Thread started!");
+            if self.conf.debug {
+                println!("FIFO reader thread started.");
+            }
 
             self.thread_handle = Some(handle);
         }
@@ -336,24 +435,23 @@ impl NifpgaFastFifoRecv {
         Ok(status)
     }
 
-    ///thread_stop stop the thread
-    fn thread_stop(&mut self, _py: Python<'_>) -> PyResult<()> {
+    /// Stop and join the reader thread. Repeated calls are harmless.
+    fn thread_stop(&mut self, py: Python<'_>) -> PyResult<()> {
         *self.stop_event.lock().unwrap() = true;
-        println!("stop_event True");
 
         if let Some(handle) = self.thread_handle.take() {
-            if handle.join().is_err() {
+            if self.conf.debug {
+                println!("Stopping FIFO reader thread.");
+            }
+            if py.detach(move || handle.join()).is_err() {
                 lock_reader_status(&self.reader_status).last_error =
                     Some("FIFO reader thread panicked".to_string());
             }
-        } else {
-            eprintln!("THREAD DO NOT EXITS");
+            if self.conf.debug {
+                println!("FIFO reader thread stopped.");
+            }
         }
 
-        self.thread_handle = None::<std::thread::JoinHandle<()>>;
-
-        // match th {
-        println!("stop_event True done");
         Ok(())
     }
 
@@ -363,6 +461,7 @@ impl NifpgaFastFifoRecv {
 
     // /// Get data as a NumPy array
     fn get_data_as_numpy<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyArray1<u64>>> {
+        self.check_queue_overflow()?;
         let debug = self.conf.debug;
 
         // Pre-allocate with estimated capacity to reduce reallocations
@@ -384,6 +483,7 @@ impl NifpgaFastFifoRecv {
 
     /// Get data as a Python tuple
     fn get_data_as_ntuple<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyTuple>> {
+        self.check_queue_overflow()?;
         let debug = self.conf.debug;
         let mut combined: Vec<u64> = Vec::new();
 
@@ -405,6 +505,7 @@ impl NifpgaFastFifoRecv {
     /// Drains the channel directly into a single Vec<u64>
     /// Returns a Python list of ints (PyO3 will convert automatically)
     fn get_data_as_list(&mut self) -> PyResult<Vec<u64>> {
+        self.check_queue_overflow()?;
         let debug = self.conf.debug;
         let mut combined: Vec<u64> = Vec::new();
 
@@ -434,6 +535,8 @@ impl NifpgaFastFifoRecv {
         d.set_item("chunks_sent", status.chunks_sent)?;
         d.set_item("elements_sent", status.elements_sent)?;
         d.set_item("last_error", status.last_error.clone())?;
+        d.set_item("queue_overflow", status.queue_overflow)?;
+        d.set_item("elements_dropped", status.elements_dropped)?;
 
         Ok(d.into())
     }
@@ -453,6 +556,8 @@ impl NifpgaFastFifoRecv {
         d.set_item("fifo_reading_buffer", self.conf.fifo_reading_buffer)?;
         d.set_item("delay_us", self.conf.delay_us)?;
         d.set_item("min_packet", self.conf.min_packet)?;
+        d.set_item("debug", self.conf.debug)?;
+        d.set_item("max_queue_chunks", self.conf.max_queue_chunks)?;
 
         Ok(d.into())
     }
